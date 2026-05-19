@@ -22,6 +22,12 @@
 #include "governor.h"
 #include "tbb_misc.h"
 
+#include <cstdio>
+
+// Lightweight TBB wakeup race instrumentation -- writes directly to stderr
+// so it appears in CI logs regardless of ntlog category filters.
+#define TBB_RACE_LOG(...) fprintf(stderr, "[TBB] " __VA_ARGS__)
+
 using rml::internal::thread_monitor;
 
 namespace tbb {
@@ -264,14 +270,28 @@ void private_worker::run() {
     while( my_state!=st_quit ) {
         if( my_server.my_slack>=0 ) {
             my_client.process(j);
+            // process() returned -- queue was empty (or task completed).
+            // If slack is now negative, we are about to try sleeping.
+            // This is the WINDOW where a concurrent non-TBB submit can lose its wakeup:
+            // if wake_some() fires between here and try_insert_in_asleep_list(), it finds
+            // the asleep list empty and just increments slack; we then consume that slack
+            // in try_insert_in_asleep_list (k>0, don't sleep), re-enter this branch, but
+            // the newly submitted task may not yet be visible in the deque.
+            if( my_server.my_slack < 0 )
+                TBB_RACE_LOG("worker idx=%zu: process() returned, slack=%d -- entering sleep path\n",
+                    my_index, (int)my_server.my_slack);
         } else {
             thread_monitor::cookie c;
             // Prepare to wait
             my_thread_monitor.prepare_wait(c);
             // Check/set the invariant for sleeping
             if( my_state!=st_quit && my_server.try_insert_in_asleep_list(*this) ) {
+                TBB_RACE_LOG("worker idx=%zu: commit_wait (sleeping) slack=%d\n",
+                    my_index, (int)my_server.my_slack);
                 my_thread_monitor.commit_wait(c);
                 __TBB_ASSERT( my_state==st_quit || !my_next, "Thread monitor missed a spurious wakeup?" );
+                TBB_RACE_LOG("worker idx=%zu: woke up slack=%d\n",
+                    my_index, (int)my_server.my_slack);
                 my_server.propagate_chain_reaction();
             } else {
                 // Invariant broken
@@ -354,9 +374,13 @@ inline bool private_server::try_insert_in_asleep_list( private_worker& t ) {
     if( k<=0 ) {
         t.my_next = my_asleep_list_root;
         my_asleep_list_root = &t;
+        TBB_RACE_LOG("worker idx=%zu going to sleep (slack=%d asleep_list_non_null=%d)\n",
+            t.my_index, (int)my_slack, my_asleep_list_root != nullptr);
         return true;
     } else {
         --my_slack;
+        TBB_RACE_LOG("worker idx=%zu NOT sleeping -- slack was positive (k=%d slack=%d)\n",
+            t.my_index, k, (int)my_slack);
         return false;
     }
 }
@@ -367,6 +391,7 @@ void private_server::wake_some( int additional_slack ) {
     private_worker**w = wakee;
     {
         asleep_list_mutex_type::scoped_lock lock(my_asleep_list_mutex);
+        const bool list_empty_on_entry = (my_asleep_list_root == nullptr);
         while( my_asleep_list_root && w<wakee+2 ) {
             if( additional_slack>0 ) {
                 if (additional_slack+my_slack<=0) // additional demand does not exceed surplus supply
@@ -386,13 +411,29 @@ void private_server::wake_some( int additional_slack ) {
         if( additional_slack ) {
             // Contribute our unused slack to my_slack.
             my_slack += additional_slack;
+            // THE RACE: no sleeping workers found, so signal is lost as a slack increment.
+            // If a worker is between prepare_wait and try_insert_in_asleep_list right now,
+            // it will find slack>0, not sleep, re-enter the task loop -- but the task may
+            // not be visible in the scheduler deque yet due to memory ordering.
+            if( list_empty_on_entry ) {
+                TBB_RACE_LOG("wake_some -- NO sleeping workers found! "
+                    "slack incremented to %d (additional_slack=%d). "
+                    "POTENTIAL WAKEUP RACE if task not yet visible in deque.\n",
+                    (int)my_slack, additional_slack);
+            }
         }
     }
 done:
-    while( w>wakee ) {
-        private_worker* ww = *--w;
-        ww->my_next = NULL;
-        ww->wake_or_launch();
+    {
+        int woken = (int)(w - wakee);
+        if( woken > 0 )
+            TBB_RACE_LOG("wake_some -- woke %d worker(s) (slack=%d)\n",
+                woken, (int)my_slack);
+        while( w>wakee ) {
+            private_worker* ww = *--w;
+            ww->my_next = NULL;
+            ww->wake_or_launch();
+        }
     }
 }
 
