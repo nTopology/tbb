@@ -26,7 +26,7 @@
 
 // Lightweight TBB wakeup race instrumentation -- writes directly to stderr
 // so it appears in CI logs regardless of ntlog category filters.
-#define TBB_RACE_LOG(...) fprintf(stderr, "[TBB] " __VA_ARGS__)
+#define TBB_RACE_LOG(...) fprintf(stdout, "[TBB] " __VA_ARGS__); fflush(stdout)
 
 using rml::internal::thread_monitor;
 
