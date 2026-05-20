@@ -23,10 +23,28 @@
 #include "tbb_misc.h"
 
 #include <cstdio>
+#if _WIN32 || _WIN64
+#include <windows.h>
+#endif
 
-// Lightweight TBB wakeup race instrumentation -- writes directly to stderr
-// so it appears in CI logs regardless of ntlog category filters.
-#define TBB_RACE_LOG(...) fprintf(stdout, "[TBB] " __VA_ARGS__); fflush(stdout)
+// Lightweight TBB wakeup race instrumentation.
+// Uses WriteFile(STD_OUTPUT_HANDLE) to bypass per-module CRT stdout buffers
+// and write directly to the OS-level stdout handle captured by the test framework.
+static void tbb_race_log(const char* msg) {
+#if _WIN32 || _WIN64
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written;
+    WriteFile(h, msg, (DWORD)strlen(msg), &written, NULL);
+#else
+    fputs(msg, stdout);
+    fflush(stdout);
+#endif
+}
+#define TBB_RACE_LOG(fmt, ...) do { \
+    char _buf[512]; \
+    snprintf(_buf, sizeof(_buf), "[TBB] " fmt, ##__VA_ARGS__); \
+    tbb_race_log(_buf); \
+} while(0)
 
 using rml::internal::thread_monitor;
 
