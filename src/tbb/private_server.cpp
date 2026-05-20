@@ -432,10 +432,6 @@ void private_server::wake_some( int additional_slack ) {
     }
 done:
     {
-        int woken = (int)(w - wakee);
-        if( woken > 0 )
-            TBB_RACE_LOG("wake_some -- woke %d worker(s) (slack=%d)\n",
-                woken, (int)my_slack);
         while( w>wakee ) {
             private_worker* ww = *--w;
             ww->my_next = NULL;
