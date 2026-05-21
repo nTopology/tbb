@@ -385,6 +385,14 @@ inline bool private_server::try_insert_in_asleep_list( private_worker& t ) {
     if( k<=0 ) {
         t.my_next = my_asleep_list_root;
         my_asleep_list_root = &t;
+        // Count how many workers are now sleeping (including this one).
+        int count = 0;
+        for( private_worker* p = my_asleep_list_root; p; p = p->my_next ) ++count;
+        int snap_k = k;
+        int snap_count = count;
+        lock.release();
+        TBB_RACE_LOG("try_insert_in_asleep_list: worker sleeping (asleep_count=%d k=%d my_slack_after_insert=%d)\n",
+            snap_count, snap_k, snap_k);
         return true;
     } else {
         --my_slack;
@@ -396,13 +404,26 @@ void private_server::wake_some( int additional_slack ) {
     __TBB_ASSERT( additional_slack>=0, NULL );
     private_worker* wakee[2];
     private_worker**w = wakee;
+    // Captured under lock, logged after lock released to avoid Heisenbug.
+    bool slack_break_taken = false;
+    int  snap_additional   = 0;
+    int  snap_slack        = 0;
+    int  snap_sleeping     = 0;
+    bool list_was_empty    = false;
+    int  snap_slack_after  = 0;
     {
         asleep_list_mutex_type::scoped_lock lock(my_asleep_list_mutex);
         const bool list_empty_on_entry = (my_asleep_list_root == nullptr);
         while( my_asleep_list_root && w<wakee+2 ) {
             if( additional_slack>0 ) {
-                if (additional_slack+my_slack<=0) // additional demand does not exceed surplus supply
+                if (additional_slack+my_slack<=0) { // additional demand does not exceed surplus supply
+                    slack_break_taken = true;
+                    snap_additional   = additional_slack;
+                    snap_slack        = (int)my_slack;
+                    // Count sleeping workers under lock (no I/O here).
+                    for( private_worker* p = my_asleep_list_root; p; p = p->my_next ) ++snap_sleeping;
                     break;
+                }
                 --additional_slack;
             } else {
                 // Chain reaction; Try to claim unit of slack
@@ -418,17 +439,21 @@ void private_server::wake_some( int additional_slack ) {
         if( additional_slack ) {
             // Contribute our unused slack to my_slack.
             my_slack += additional_slack;
-            // THE RACE: no sleeping workers found, so signal is lost as a slack increment.
-            // If a worker is between prepare_wait and try_insert_in_asleep_list right now,
-            // it will find slack>0, not sleep, re-enter the task loop -- but the task may
-            // not be visible in the scheduler deque yet due to memory ordering.
-            if( list_empty_on_entry ) {
-                TBB_RACE_LOG("wake_some -- NO sleeping workers found! "
-                    "slack incremented to %d (additional_slack=%d). "
-                    "POTENTIAL WAKEUP RACE if task not yet visible in deque.\n",
-                    (int)my_slack, additional_slack);
-            }
+            list_was_empty   = list_empty_on_entry;
+            snap_slack_after = (int)my_slack;
         }
+    }
+    // Log after releasing the spin mutex to avoid serialising the race window.
+    if( slack_break_taken ) {
+        TBB_RACE_LOG("wake_some -- SLACK BREAK: %d worker(s) sleeping, none woken! "
+            "additional_slack=%d my_slack=%d sum=%d. WAKEUP RACE.\n",
+            snap_sleeping, snap_additional, snap_slack,
+            snap_additional + snap_slack);
+    }
+    if( list_was_empty ) {
+        TBB_RACE_LOG("wake_some -- NO sleeping workers found! "
+            "slack incremented to %d. WAKEUP RACE.\n",
+            snap_slack_after);
     }
 done:
     {
