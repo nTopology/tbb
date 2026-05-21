@@ -295,6 +295,9 @@ void private_worker::run() {
             // the asleep list empty and just increments slack; we then consume that slack
             // in try_insert_in_asleep_list (k>0, don't sleep), re-enter this branch, but
             // the newly submitted task may not yet be visible in the deque.
+            if( my_server.my_slack<0 && my_server.my_n_thread<=20 )
+                TBB_RACE_LOG("process() returned, slack negative (my_slack=%d nthread=%d) -- entering sleep path\n",
+                    (int)my_server.my_slack, (int)my_server.my_n_thread);
         } else {
             thread_monitor::cookie c;
             // Prepare to wait
@@ -303,6 +306,9 @@ void private_worker::run() {
             if( my_state!=st_quit && my_server.try_insert_in_asleep_list(*this) ) {
                 my_thread_monitor.commit_wait(c);
                 __TBB_ASSERT( my_state==st_quit || !my_next, "Thread monitor missed a spurious wakeup?" );
+                if( my_server.my_n_thread<=20 )
+                    TBB_RACE_LOG("worker woke from sleep (my_slack=%d nthread=%d)\n",
+                        (int)my_server.my_slack, (int)my_server.my_n_thread);
                 my_server.propagate_chain_reaction();
             } else {
                 // Invariant broken
